@@ -1,163 +1,223 @@
 import streamlit as st
 import pandas as pd
-import tabula
+import pdfplumber
 from pathlib import Path
-import os
 import tempfile
 import zipfile
+import re
 
 
-# The core function from your notebook, slightly adapted for Streamlit context
-def extract_tables_tabula_streamlit(
+def extract_tables_pdfplumber_streamlit(
     pdf_path, output_dir="streamlit_tables", single_sql_file="all_insert_statements.sql"
 ):
     """
-    Extract tables from PDF using tabula-py and generate CSV, Excel, and optionally a single SQL insert file.
+    Extract tables from PDF using pdfplumber and generate CSV, Excel, and SQL insert files.
+    No Java required!
     """
-    # Ensure the output directory exists
     output_path = Path(output_dir)
     output_path.mkdir(exist_ok=True)
 
-    # List to hold all SQL statements for a single file
     all_sql_statements = []
-    extracted_files = []  # To keep track of all generated files for potential zipping
+    extracted_files = []
+    all_tables = []
 
     try:
-        # Extract all tables from PDF
-        tables = tabula.read_pdf(pdf_path, pages="all", multiple_tables=True)
+        with pdfplumber.open(pdf_path) as pdf:
+            for page_num, page in enumerate(pdf.pages, 1):
+                # Try different table extraction settings
+                # First try: default settings
+                tables = page.extract_tables()
+
+                # If no tables found, try with table settings
+                if not tables or len(tables) == 0:
+                    # Try with custom table detection
+                    tables = page.extract_tables(
+                        {"vertical_strategy": "lines", "horizontal_strategy": "lines"}
+                    )
+
+                for table_num, table in enumerate(tables, 1):
+                    if table and len(table) > 1:
+                        # Clean and convert to DataFrame
+                        # Find first non-empty row as header
+                        header_row = None
+                        data_rows = []
+
+                        for row_idx, row in enumerate(table):
+                            # Check if row has any non-empty/None values
+                            if any(
+                                cell is not None and str(cell).strip() for cell in row
+                            ):
+                                if header_row is None:
+                                    # Use this as header
+                                    header_row = [
+                                        str(cell).strip() if cell else f"Column_{i+1}"
+                                        for i, cell in enumerate(row)
+                                    ]
+                                else:
+                                    # This is a data row
+                                    clean_row = [
+                                        str(cell).strip() if cell else ""
+                                        for cell in row
+                                    ]
+                                    data_rows.append(clean_row)
+
+                        if header_row and data_rows:
+                            # Create DataFrame
+                            df = pd.DataFrame(data_rows, columns=header_row)
+
+                            # Remove completely empty rows and columns
+                            df = df.replace(r"^\s*$", pd.NA, regex=True)
+                            df = df.dropna(how="all").dropna(axis=1, how="all")
+
+                            if not df.empty:
+                                all_tables.append(df)
+
+                                # Display table
+                                st.subheader(
+                                    f"Table {len(all_tables)} (Page {page_num})"
+                                )
+                                st.dataframe(df.head())
+
+                                # Save as CSV
+                                csv_path = output_path / f"table_{len(all_tables)}.csv"
+                                df.to_csv(csv_path, index=False)
+                                extracted_files.append(csv_path)
+                                st.success(f"Saved as CSV: {csv_path.name}")
+
+                                # Save as Excel
+                                excel_path = (
+                                    output_path / f"table_{len(all_tables)}.xlsx"
+                                )
+                                df.to_excel(excel_path, index=False)
+                                extracted_files.append(excel_path)
+                                st.success(f"Saved as Excel: {excel_path.name}")
+
+                                # Generate SQL
+                                table_name = f"table_{len(all_tables)}"
+                                # Sanitize column names
+                                columns = ", ".join(
+                                    [
+                                        f'"{re.sub(r"[^\w]", "_", str(col))}"'
+                                        for col in df.columns
+                                    ]
+                                )
+
+                                all_sql_statements.append(
+                                    f"-- Insert statements for {table_name}"
+                                )
+
+                                for _, row in df.iterrows():
+                                    values = []
+                                    for val in row:
+                                        if pd.isna(val) or val == "":
+                                            values.append("NULL")
+                                        elif isinstance(val, str):
+                                            clean_val = (
+                                                val.replace("'", "''")
+                                                .replace("\n", "\\n")
+                                                .replace("\r", "")
+                                            )
+                                            values.append(f"'{clean_val}'")
+                                        else:
+                                            values.append(str(val))
+
+                                    values_str = ", ".join(values)
+                                    all_sql_statements.append(
+                                        f"INSERT INTO {table_name} ({columns}) VALUES ({values_str});"
+                                    )
+
+                                all_sql_statements.append("\n")
+                                st.write("-" * 50)
+
+        if all_tables and all_sql_statements:
+            single_sql_path = output_path / single_sql_file
+            with open(single_sql_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(all_sql_statements))
+            extracted_files.append(single_sql_path)
+            st.success(f"SQL insert statements saved to {single_sql_path.name}")
+
+        return all_tables, extracted_files
+
     except Exception as e:
         st.error(f"Error extracting tables from PDF: {e}")
+        st.info(
+            "💡 Tip: Make sure your PDF has clearly formatted tables with borders or consistent spacing."
+        )
         return [], []
 
-    if not tables:
-        st.warning("No tables found in the PDF.")
-        return [], []
 
-    st.write(f"Found {len(tables)} tables in the PDF.")
-
-    # Store each table and generate SQL insert statements
-    for i, table in enumerate(tables):
-        if not table.empty:
-            st.subheader(f"Table {i+1}")
-            st.dataframe(table.head())
-
-            # Save as CSV
-            csv_path = output_path / f"table_{i+1}.csv"
-            table.to_csv(csv_path, index=False)
-            extracted_files.append(csv_path)
-            st.success(f"Saved table {i+1} as CSV: {csv_path.name}")
-
-            # Save as Excel
-            excel_path = output_path / f"table_{i+1}.xlsx"
-            table.to_excel(excel_path, index=False)
-            extracted_files.append(excel_path)
-            st.success(f"Saved table {i+1} as Excel: {excel_path.name}")
-
-            # Generate SQL Insert Statements
-            table_name = f"table_{i+1}"  # Using generic table names, adjust if specific names are needed
-
-            # Sanitize column names for SQL: replace spaces with underscores, remove parentheses, newlines
-            columns = ", ".join(
-                [
-                    f'"{(col.replace(" ", "_").replace("(", "").replace(")", "").replace("\r\n", "_").replace("\n", "_"))}"'
-                    for col in table.columns
-                ]
-            )
-
-            # Add a comment for the table
-            all_sql_statements.append(f"-- Insert statements for {table_name}")
-
-            for index, row in table.iterrows():
-                values = []
-                for val in row:
-                    if pd.isna(val):
-                        values.append("NULL")
-                    elif isinstance(val, str):
-                        # Escape single quotes within the string and handle newlines for SQL
-                        clean_val = (
-                            val.replace("'", "''")
-                            .replace("\r\n", "\\n")
-                            .replace("\n", "\\n")
-                        )
-                        values.append(f"'{clean_val}'")
-                    else:
-                        values.append(str(val))
-                values_str = ", ".join(values)
-                all_sql_statements.append(
-                    f"INSERT INTO {table_name} ({columns}) VALUES ({values_str});"
-                )
-            all_sql_statements.append(
-                "\n"
-            )  # Add a newline for readability between tables
-
-            st.write("-" * 50)
-
-    # Write all collected SQL statements to a single file
-    if all_sql_statements:
-        single_sql_path = output_path / single_sql_file
-        with open(single_sql_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(all_sql_statements))
-        extracted_files.append(single_sql_path)
-        st.success(f"All SQL insert statements saved to {single_sql_path.name}")
-
-    return tables, extracted_files
-
-
-st.title("PDF Table Extractor")
+st.set_page_config(page_title="PDF Table Extractor", layout="wide")
+st.title("📊 PDF Table Extractor")
 st.markdown(
     "Upload a PDF file to extract tables and generate CSV, Excel, and SQL insert statements."
+)
+st.info(
+    "⚠️ **Note:** This version uses pdfplumber and does NOT require Java. It works on Streamlit Cloud without any additional setup!"
 )
 
 uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
 
 if uploaded_file is not None:
     with tempfile.TemporaryDirectory() as tmpdir:
-        # Save the uploaded file temporarily
         temp_pdf_path = Path(tmpdir) / uploaded_file.name
         with open(temp_pdf_path, "wb") as f:
             f.write(uploaded_file.getbuffer())
 
-        st.info(f"Processing PDF: {uploaded_file.name}...")
+        st.info(f"📄 Processing PDF: {uploaded_file.name}...")
 
-        # Define output directory within the temporary directory
         output_dir = Path(tmpdir) / "extracted_tables"
         output_dir.mkdir(exist_ok=True)
 
-        extracted_tables, generated_files = extract_tables_tabula_streamlit(
-            str(temp_pdf_path), output_dir=str(output_dir)
-        )
+        with st.spinner("Extracting tables from PDF..."):
+            extracted_tables, generated_files = extract_tables_pdfplumber_streamlit(
+                str(temp_pdf_path), output_dir=str(output_dir)
+            )
 
         if generated_files:
-            st.subheader("Download Extracted Files")
+            st.subheader("📥 Download Extracted Files")
 
-            # Create a zip file of all generated files
+            # Create ZIP file
             zip_file_path = Path(tmpdir) / "extracted_data.zip"
             with zipfile.ZipFile(zip_file_path, "w", zipfile.ZIP_DEFLATED) as zipf:
                 for file_path in generated_files:
-                    zipf.write(
-                        file_path, arcname=file_path.name
-                    )  # Add file with just its name
+                    zipf.write(file_path, arcname=file_path.name)
 
-            with open(zip_file_path, "rb") as f:
-                st.download_button(
-                    label="Download All Extracted Files (ZIP)",
-                    data=f.read(),
-                    file_name="extracted_data.zip",
-                    mime="application/zip",
-                )
+            # Download buttons in columns
+            col1, col2 = st.columns(2)
 
-            # Also offer individual downloads for SQL if it exists
-            sql_file = output_dir / "all_insert_statements.sql"
-            if sql_file.exists():
-                with open(sql_file, "rb") as f:
+            with col1:
+                with open(zip_file_path, "rb") as f:
                     st.download_button(
-                        label="Download SQL Insert Statements",
+                        label="📦 Download All Files (ZIP)",
                         data=f.read(),
-                        file_name=sql_file.name,
-                        mime="text/plain",
+                        file_name="extracted_data.zip",
+                        mime="application/zip",
+                        use_container_width=True,
                     )
 
+            # Individual file downloads
+            with st.expander("📁 Download Individual Files"):
+                for file_path in generated_files:
+                    with open(file_path, "rb") as f:
+                        st.download_button(
+                            label=f"📄 {file_path.name}",
+                            data=f.read(),
+                            file_name=file_path.name,
+                            mime="application/octet-stream",
+                            key=str(file_path),
+                        )
+
         if extracted_tables:
-            st.success("Table extraction complete!")
+            st.success(
+                f"✅ Successfully extracted {len(extracted_tables)} tables from your PDF!"
+            )
         else:
-            st.warning("No tables could be extracted or processed.")
+            st.warning("⚠️ No tables could be extracted.")
+            st.info(
+                """
+            **Troubleshooting tips:**
+            - Make sure your PDF contains tables with clear borders or consistent formatting
+            - Try a different PDF file
+            - If your PDF has scanned images, you'll need OCR (Optical Character Recognition)
+            """
+            )
